@@ -23,7 +23,6 @@ BASE_DIR = Path(os.getenv("WEARNEXT_BASE_DIR", ".")).resolve()
 EXPORT_DIR = Path(os.getenv("WEARNEXT_EXPORT_DIR", "exports")).resolve()
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── FIX: Persistent folder where uploaded images are kept so Strapi can receive them ──
 IMAGES_DIR = Path(os.getenv("WEARNEXT_IMAGES_DIR", EXPORT_DIR / "images")).resolve()
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -46,6 +45,8 @@ STRAPI_SUBCATEGORIES_ENDPOINT = os.getenv("STRAPI_SUBCATEGORIES_ENDPOINT", f"{ST
 STRAPI_COLOURS_ENDPOINT = os.getenv("STRAPI_COLOURS_ENDPOINT", f"{STRAPI_BASE_URL}/api/colours").rstrip("/")
 STRAPI_PATTERNS_ENDPOINT = os.getenv("STRAPI_PATTERNS_ENDPOINT", f"{STRAPI_BASE_URL}/api/patterns").rstrip("/")
 STRAPI_FEATURES_ENDPOINT = os.getenv("STRAPI_FEATURES_ENDPOINT", f"{STRAPI_BASE_URL}/api/features").rstrip("/")
+# ── FIX: Added fits endpoint so fit is pushed as a Strapi relation ──
+STRAPI_FITS_ENDPOINT = os.getenv("STRAPI_FITS_ENDPOINT", f"{STRAPI_BASE_URL}/api/fits").rstrip("/")
 STRAPI_HEADERS = {"Authorization": f"Bearer {STRAPI_TOKEN}"} if STRAPI_TOKEN else {}
 
 
@@ -263,14 +264,7 @@ def _save_upload_to_temp(upload: UploadFile) -> tuple[str, str]:
         return tmp.name, Path(upload.filename or tmp.name).name
 
 
-# ── FIX: Copy image from temp to a persistent path so it survives after /predict ──
 def _persist_image(temp_path: str, image_name: str) -> str:
-    """
-    Copy the uploaded image from the temp file into IMAGES_DIR before the
-    temp file is deleted. The persistent copy is what gets sent to Strapi
-    when the user later clicks 'Push to Strapi'.
-    Handles filename collisions by appending a counter.
-    """
     dest = IMAGES_DIR / image_name
     counter = 1
     while dest.exists():
@@ -379,6 +373,8 @@ def _load_strapi_maps() -> dict[str, dict[str, int]]:
         "colours": _build_label_to_id_map(STRAPI_COLOURS_ENDPOINT),
         "patterns": _build_label_to_id_map(STRAPI_PATTERNS_ENDPOINT),
         "features": _build_label_to_id_map(STRAPI_FEATURES_ENDPOINT),
+        # ── FIX: Added fits to the Strapi label map ──
+        "fits": _build_label_to_id_map(STRAPI_FITS_ENDPOINT),
     }
 
 
@@ -396,8 +392,6 @@ def _map_label_flexible(label: str | None, mapping_dict: dict[str, int]) -> int 
 
 
 def _strapi_upload_image(image_path: str | None) -> tuple[int | None, str | None]:
-    # ── FIX: Now image_path points to the persistent copy in IMAGES_DIR, so
-    # this will succeed. If somehow the file is still missing, we skip silently.
     if not image_path or not os.path.exists(image_path):
         return None, None
     mime_type = mimetypes.guess_type(image_path)[0] or "application/octet-stream"
@@ -420,16 +414,19 @@ def _strapi_push_default_inventory(record: dict[str, Any]) -> dict[str, Any]:
     pred = (record or {}).get("prediction", {}) or {}
     image_id, image_url = _strapi_upload_image(record.get("image_path"))
 
-    cat = pred.get("category")
-    subcat = pred.get("subcategory")
-    colour = pred.get("colour")
+    cat     = pred.get("category")
+    subcat  = pred.get("subcategory")
+    colour  = pred.get("colour")
     pattern = pred.get("pattern")
-    feats = pred.get("features") or []
+    fit     = pred.get("fit")
+    feats   = pred.get("features") or []
 
-    cat_id = _map_label_flexible(cat, STRAPI_MAPS["categories"]) or (_strapi_resolve_id(STRAPI_CATEGORIES_ENDPOINT, cat) if cat else None)
-    subcat_id = _map_label_flexible(subcat, STRAPI_MAPS["subcategories"]) or (_strapi_resolve_id(STRAPI_SUBCATEGORIES_ENDPOINT, subcat) if subcat else None)
-    colour_id = _map_label_flexible(colour, STRAPI_MAPS["colours"]) or (_strapi_resolve_id(STRAPI_COLOURS_ENDPOINT, colour) if colour else None)
-    pattern_id = _map_label_flexible(pattern, STRAPI_MAPS["patterns"]) or (_strapi_resolve_id(STRAPI_PATTERNS_ENDPOINT, pattern) if pattern else None)
+    cat_id     = _map_label_flexible(cat,     STRAPI_MAPS["categories"])    or (_strapi_resolve_id(STRAPI_CATEGORIES_ENDPOINT,    cat)     if cat     else None)
+    subcat_id  = _map_label_flexible(subcat,  STRAPI_MAPS["subcategories"]) or (_strapi_resolve_id(STRAPI_SUBCATEGORIES_ENDPOINT, subcat)  if subcat  else None)
+    colour_id  = _map_label_flexible(colour,  STRAPI_MAPS["colours"])       or (_strapi_resolve_id(STRAPI_COLOURS_ENDPOINT,       colour)  if colour  else None)
+    pattern_id = _map_label_flexible(pattern, STRAPI_MAPS["patterns"])      or (_strapi_resolve_id(STRAPI_PATTERNS_ENDPOINT,      pattern) if pattern else None)
+    # ── FIX: Resolve fit as a proper Strapi relation instead of plain text ──
+    fit_id     = _map_label_flexible(fit,     STRAPI_MAPS["fits"])          or (_strapi_resolve_id(STRAPI_FITS_ENDPOINT,          fit)     if fit     else None)
 
     feat_ids: list[int] = []
     for feat in feats:
@@ -439,22 +436,15 @@ def _strapi_push_default_inventory(record: dict[str, Any]) -> dict[str, Any]:
     feat_ids = list(dict.fromkeys(feat_ids))
 
     data: dict[str, Any] = {"name": record.get("image_name") or f"outfit-{record.get('timestamp', '')}"}
-    if image_id is not None:
-        data["image"] = image_id
-    if image_url:
-        data["image_url"] = image_url
-    if cat_id is not None:
-        data["categories"] = [cat_id]
-    if subcat_id is not None:
-        data["sub_categories"] = [subcat_id]
-    if colour_id is not None:
-        data["colours"] = [colour_id]
-    if pattern_id is not None:
-        data["patterns"] = [pattern_id]
-    if feat_ids:
-        data["features"] = feat_ids
-    if pred.get("fit"):
-        data["fit_text"] = pred.get("fit")
+    if image_id  is not None: data["image"]          = image_id
+    if image_url:             data["image_url"]       = image_url
+    if cat_id    is not None: data["categories"]      = [cat_id]
+    if subcat_id is not None: data["sub_categories"]  = [subcat_id]
+    if colour_id is not None: data["colours"]         = [colour_id]
+    if pattern_id is not None: data["patterns"]       = [pattern_id]
+    # ── FIX: Push fit as a relation (was previously pushed as plain fit_text) ──
+    if fit_id    is not None: data["fits"]            = [fit_id]
+    if feat_ids:              data["features"]        = feat_ids
 
     payload = {"data": data}
     r = requests.post(
@@ -502,8 +492,6 @@ def predict(file: UploadFile = File(...)) -> dict[str, Any]:
     image_path, image_name = _save_upload_to_temp(file)
     try:
         pred = gemini_classify_primary(image_path)
-        # ── FIX: Persist the image before the temp file is deleted so
-        # the frontend can send the path back during export for Strapi upload ──
         persistent_path = _persist_image(image_path, image_name)
         record = _record_from_pred(persistent_path, image_name, pred, source="llm")
         return record
@@ -644,20 +632,20 @@ def startup_event() -> None:
     print(f"  [INFO]  EXPORT_DIR  resolved to: {EXPORT_DIR}")
 
     taxonomy_paths = {
-        "categories": CATEGORIES_JSON,
-        "colours": COLOURS_JSON,
-        "patterns": PATTERN_JSON,
-        "fits": FIT_JSON,
-        "features": FEATURES_JSON,
+        "categories":   CATEGORIES_JSON,
+        "colours":      COLOURS_JSON,
+        "patterns":     PATTERN_JSON,
+        "fits":         FIT_JSON,
+        "features":     FEATURES_JSON,
         "subcategories": SUBCATS_JSON,
     }
     taxonomy_counts = {
-        "categories": len(category_labels),
+        "categories":    len(category_labels),
         "subcategories": len(subcategory_labels),
-        "colours": len(colour_labels),
-        "patterns": len(pattern_labels),
-        "fits": len(fit_labels),
-        "features": len(feature_labels),
+        "colours":       len(colour_labels),
+        "patterns":      len(pattern_labels),
+        "fits":          len(fit_labels),
+        "features":      len(feature_labels),
     }
 
     all_ok = True
